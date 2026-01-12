@@ -1,0 +1,124 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - linux-gcc
+          - macos
+          - windows-cygwin-64
+        include:
+          - build: linux-gcc
+            os: ubuntu-22.04
+            cc: gcc
+            arch: x86_64
+          - build: macos
+            os: macos-15
+          - build: windows-cygwin-64
+            os: windows-latest
+            arch: x86_64
+            installer_arch: x64
+            shell: bash
+
+    env:
+      CI_TARGET_BUILD: ${{ matrix.build }}
+      CI_TARGET_ARCH: ${{ matrix.arch }}
+      CC: ${{ matrix.cc }}
+
+    steps:
+      - name: git config line endings (Windows)
+        if: ${{ contains( matrix.build, 'windows' ) }}
+        run: git config --global core.autocrlf input
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Cygwin toolchain (Windows)
+        if: ${{ startsWith(matrix.build, 'windows-cygwin') }}
+        uses: cygwin/cygwin-install-action@master
+        with:
+          packages: >
+            mingw64-${{matrix.arch}}-binutils
+            mingw64-${{matrix.arch}}-CUnit
+            mingw64-${{matrix.arch}}-curl
+            mingw64-${{matrix.arch}}-dlfcn
+            mingw64-${{matrix.arch}}-gcc-core
+            mingw64-${{matrix.arch}}-headers
+            mingw64-${{matrix.arch}}-runtime
+            mingw64-${{matrix.arch}}-zlib
+
+      - name: install bash 4 (macOS)
+        if: ${{ contains( matrix.build, 'macOS' ) }}
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install bash
+
+      - name: Install dependencies (Common)
+        if: ${{ !contains(matrix.build, 'macos') }}
+        run: ${{matrix.shell}} ./ci/actions-install.sh
+
+      - name: Build (Linux x86_64 Portable)
+        if: ${{ matrix.build == 'linux-gcc' }}
+        run: |
+          ./configure --build-static --disable-native --disable-rdma --disable-libnfs --disable-rbd --disable-gfapi --disable-pmem --disable-lex --disable-tcmalloc
+          make -j $(nproc)
+          tar -czvf fio-linux-x86_64.tar.gz fio
+
+      - name: Build (macOS)
+        if: ${{ contains(matrix.build, 'macos') }}
+        run: |
+          ./configure --disable-native --disable-libnfs --disable-lex --disable-pmem
+          make -j $(sysctl -n hw.logicalcpu)
+          tar -czvf fio-darwin.tar.gz fio
+
+      - name: Build (Windows)
+        if: ${{ contains(matrix.build, 'windows') }}
+        run: |
+          ${{matrix.shell}} ./ci/actions-build.sh
+          tar -czvf fio-windows-x86_64.tar.gz fio.exe
+
+      - name: Remove dependency files to resolve Makefile Cygwin sed issue (Windows)
+        if: ${{ startsWith(matrix.build, 'windows-cygwin') }}
+        run: rm *.d */*.d */*/*.d
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.build }}
+          path: "*.tar.gz"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(git describe --tags --always --dirty)
+          TAG_NAME="fio-${VERSION}"
+          gh release create "$TAG_NAME" artifacts/*.tar.gz \
+            --target $GITHUB_SHA \
+            --title "Fio ${VERSION}"
